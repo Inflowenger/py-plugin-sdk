@@ -5,22 +5,20 @@
 # The version that actually ships is the one in pyproject.toml; the tag must
 # match it. Bump and commit pyproject.toml first, then tag.
 #
-# Uses PyPI Trusted Publishing (OIDC) — no API token secret needed. Configure a
-# "pending publisher" on PyPI once, with these fields and NOTHING in the
-# "Environment name" box (this workflow declares no environment, so the two must
-# both be blank):
+# Auth: PyPI API token, stored as a GitHub Actions secret named PYPI_API_TOKEN.
 #
-#   PyPI Project Name : inflowenger-plugin-sdk
-#   Owner             : Inflowenger
-#   Repository name   : py-plugin-sdk
-#   Workflow name     : publish.yml
-#   Environment name  : (leave empty)
+#   1. On PyPI: Account settings → API tokens → "Add API token". With no
+#      projects yet you can only make an ACCOUNT-scoped token — that's fine for
+#      the first release. Copy the whole value (it starts with `pypi-`).
+#   2. On GitHub: repo → Settings → Secrets and variables → Actions → New
+#      repository secret. Name it exactly PYPI_API_TOKEN, paste the token.
+#   3. Push a tag (below). After the first upload succeeds, create a
+#      PROJECT-scoped token, replace the secret, and delete the account token.
 #
-# after that this runs with no stored token. If you later want a protected
-# GitHub Environment, add `environment: pypi` to the job below AND set the same
-# name in the PyPI publisher — they must match exactly or PyPI returns
-# `invalid-publisher`. To use an API token instead, drop `permissions.id-token`
-# and pass `password: ${{ secrets.PYPI_API_TOKEN }}` to the publish step.
+# Prefer no stored secret? Switch to Trusted Publishing: add back
+# `permissions: id-token: write`, drop the `with: password:` on the publish
+# step, and register a pending publisher on PyPI (owner Inflowenger, repo
+# py-plugin-sdk, workflow publish.yml, environment blank).
 name: Publish
 
 on:
@@ -33,7 +31,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write # PyPI trusted publishing (OIDC)
     steps:
       - uses: actions/checkout@v4
 
@@ -58,3 +55,5 @@ jobs:
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
