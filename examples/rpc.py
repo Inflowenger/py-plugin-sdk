@@ -1,6 +1,12 @@
 """RPC sample plugin — the Python equivalent of TestCommands in sdkv1_test.go.
 
-A pure context function: read context and return. Run: python -m examples.rpc
+A pure context function: read context and return.
+
+Setup (uses the SDK published on PyPI):
+    pip install inflowenger-plugin-sdk
+    cp .env.inflow.example .env.inflow   # then fill in your values
+Run:
+    python examples/rpc.py
 """
 import asyncio
 

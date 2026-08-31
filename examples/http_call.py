@@ -1,6 +1,10 @@
 """HTTP.CALL sample plugin — the Python equivalent of TestInit in sdkv1_test.go.
 
-Run: python -m examples.http_call   (after setting .env.inflow)
+Setup (uses the SDK published on PyPI):
+    pip install inflowenger-plugin-sdk
+    cp .env.inflow.example .env.inflow   # then fill in your values
+Run:
+    python examples/http_call.py
 """
 import asyncio
 import json

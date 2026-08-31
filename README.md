@@ -35,14 +35,21 @@ like the Go handlers return `err` or `msg.Data`.
 ## Install
 
 ```bash
-pip install -e .        # depends on nats-py and python-dotenv
+pip install inflowenger-plugin-sdk        # pulls nats-py and python-dotenv
+```
+
+Working *on* the SDK itself? Clone the repo and install it editable, so your
+source edits are picked up without reinstalling:
+
+```bash
+pip install -e ".[dev]"                   # editable, plus pytest / build / twine
 ```
 
 ## Quick start
 
 ```python
 import asyncio
-from inflow_plugin_sdk import Action, Job, new_plugin, with_dot_env
+from inflow_plugin_sdk import Action, Frame, Job, new_plugin, with_dot_env
 
 
 async def main() -> None:
@@ -52,7 +59,7 @@ async def main() -> None:
     p.intro_data.version = "v0.0.1"
 
     async def handler(job: Job) -> None:
-        await job.progress(10, __import__("inflow_plugin_sdk").Frame(title="init", content="working"))
+        await job.progress(10, Frame(title="init", content="working"))
         await job.done({"action": "done"})
 
     p.add_action(Action(method="fn", request_handler=handler))
