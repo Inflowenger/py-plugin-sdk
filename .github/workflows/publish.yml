@@ -6,10 +6,21 @@
 # match it. Bump and commit pyproject.toml first, then tag.
 #
 # Uses PyPI Trusted Publishing (OIDC) — no API token secret needed. Configure a
-# "pending publisher" on PyPI once (project name, owner/repo, workflow file
-# `publish.yml`, environment `pypi`); after that this runs with no stored token.
-# To use an API token instead, drop `permissions.id-token` and pass
-# `password: ${{ secrets.PYPI_API_TOKEN }}` to the publish step.
+# "pending publisher" on PyPI once, with these fields and NOTHING in the
+# "Environment name" box (this workflow declares no environment, so the two must
+# both be blank):
+#
+#   PyPI Project Name : inflowenger-plugin-sdk
+#   Owner             : Inflowenger
+#   Repository name   : py-plugin-sdk
+#   Workflow name     : publish.yml
+#   Environment name  : (leave empty)
+#
+# after that this runs with no stored token. If you later want a protected
+# GitHub Environment, add `environment: pypi` to the job below AND set the same
+# name in the PyPI publisher — they must match exactly or PyPI returns
+# `invalid-publisher`. To use an API token instead, drop `permissions.id-token`
+# and pass `password: ${{ secrets.PYPI_API_TOKEN }}` to the publish step.
 name: Publish
 
 on:
@@ -20,7 +31,6 @@ on:
 jobs:
   publish:
     runs-on: ubuntu-latest
-    environment: pypi
     permissions:
       contents: read
       id-token: write # PyPI trusted publishing (OIDC)
