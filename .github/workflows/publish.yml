@@ -20,7 +20,7 @@ on:
 jobs:
   publish:
     runs-on: ubuntu-latest
-    environment: pypi
+    environment: 
     permissions:
       contents: read
       id-token: write # PyPI trusted publishing (OIDC)
