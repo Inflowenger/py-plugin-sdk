@@ -142,7 +142,14 @@ async def actions_handler(p) -> None:
                     return
                 job_id = str(uuid.uuid4())
                 new_req = ActionRequest(job_id, action.method, _req_from(p, msg))
-                await with_job_handler(action.request_handler)(new_req, msg)
+                try:
+                    await with_job_handler(action.request_handler)(new_req, msg)
+                except Exception as e:
+                    # Handler errors are already reported to the runtime as
+                    # DoneWithError inside with_job_handler. Reaching here means the
+                    # accept/ack itself failed (no jobId assigned, nothing to report)
+                    # — just log so the plugin keeps serving other requests.
+                    print(f"action {action.method} accept error: {e}")
 
             return cpu_cb
 

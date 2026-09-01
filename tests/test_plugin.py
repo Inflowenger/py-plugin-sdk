@@ -110,3 +110,34 @@ async def test_cmd_svc_call_rejects_blank_action(plugin):
     job = Job(plugin, "act", "jid", Request(data=b""))
     result = await job.cmd_svc_call("  ", {"a": 1})
     assert isinstance(result, ValueError)
+
+
+async def test_raising_action_handler_reports_done_with_error(plugin, conn):
+    async def boom(job: Job):
+        raise RuntimeError("handler exploded")
+
+    plugin.add_action(Action(method="act", request_handler=boom))
+    await plugin.start()
+
+    m = MockMsg(data=b"{}")
+    # Must not raise out of the dispatch callback — the plugin keeps running.
+    await conn.subs["inflow.cpu.PID.act"](m)
+
+    # The request was still acked with a jobId...
+    ack = json.loads(m.responses[0])
+    assert "jobId" in ack
+
+    # ...and the failure was reported to the runtime as a terminal DoneWithError
+    # (progress 100, reason on the canonical "error" detail), not swallowed.
+    assert len(conn.requests) == 1
+    sub, body = conn.requests[0]
+    assert sub == f"inflow.cpu.PID.{ack['jobId']}.progress"
+    payload = json.loads(body)
+    assert payload["progress"] == 100
+    assert payload["details"]["error"] == "handler exploded"
+
+
+async def test_cmd_svc_call_unserializable_data_returns_error_not_raise(plugin):
+    job = Job(plugin, "act", "jid", Request(data=b""))
+    result = await job.cmd_svc_call("svc", data=object())  # object() is not JSON-able
+    assert isinstance(result, Exception)

@@ -36,12 +36,23 @@ def cast_request_to(data: bytes) -> RequestBody:
 
 
 def with_job_handler(job_handler: JobHandler) -> Callable:
-    """Wrap a handler so an incoming request is accepted then run."""
+    """Wrap a handler so an incoming request is accepted then run.
+
+    Once the request is accepted the jobId is assigned and the runtime is waiting
+    for a terminal command (Done / DoneWithError). So if the handler raises
+    instead of finishing the job itself, the failure is reported back to the
+    runtime as DoneWithError — never swallowed, or the runtime hangs waiting for a
+    result that never comes. (DoneWithError goes through Plugin.send, which
+    returns its own error rather than raising, so this reporting cannot itself
+    crash the plugin.)"""
 
     async def run(ar: ActionRequest, msg) -> None:
         job = await ar.accept(msg)
-        result = job_handler(job)
-        if inspect.isawaitable(result):
-            await result
+        try:
+            result = job_handler(job)
+            if inspect.isawaitable(result):
+                await result
+        except Exception as e:
+            await job.done_with_error(str(e))
 
     return run

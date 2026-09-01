@@ -68,7 +68,10 @@ class Job:
         if action.strip() == "":
             return ValueError("invalid subject")
         envelope = CallSvcBody(data=data, op=op_data)
-        req_body = marshal(envelope)
+        try:
+            req_body = marshal(envelope)
+        except Exception as err:
+            return err
         sub = self._make_call_svc_subject(action)
         msg, err = await self._send(sub, req_body)
         if err is not None:
