@@ -38,6 +38,11 @@ class Plugin:
         self.actions: list[Action] = []
         self.meta_fn: list[Meta] = []
         self.send_timeout: float = DEFAULT_SEND_TIMEOUT
+        # In-flight handler tasks. Handlers run off the NATS dispatch coroutine (see
+        # inflow_v1.py) so concurrent calls to one subject don't serialize; asyncio
+        # only holds a weak reference to a bare create_task, so we keep a strong one
+        # here (discarded on completion) to stop the loop from cancelling it as garbage.
+        self.jobs: set = set()
 
     # ---- registration (call before start) ---------------------------------
 

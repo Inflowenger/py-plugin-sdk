@@ -143,7 +143,7 @@ async def actions_handler(p) -> None:
                 job_id = str(uuid.uuid4())
                 new_req = ActionRequest(job_id, action.method, _req_from(p, msg))
                 try:
-                    await with_job_handler(action.request_handler)(new_req, msg)
+                    await with_job_handler(action.request_handler, p.jobs)(new_req, msg)
                 except Exception as e:
                     # Handler errors are already reported to the runtime as
                     # DoneWithError inside with_job_handler. Reaching here means the
