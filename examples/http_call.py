@@ -20,6 +20,11 @@ async def main() -> None:
     p.intro_data.author = "inflow Dev. Team"
     p.intro_data.version = "v0.0.1"
 
+    # Optional: watch the runtime's signal port. This sample only logs what it
+    # hears; a plugin holding cancellable work would abort whatever it filed under
+    # sig.job_id when canceled(sig.conclusion) is true.
+    p.on_signal(lambda sig: print(f"signal {sig.kind} job={sig.job_id} conclusion={sig.conclusion}"))
+
     # Action 1: perform a real outbound HTTP request driven by the node's form.
     async def http_call(job: Job) -> None:
         try:

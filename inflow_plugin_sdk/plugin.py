@@ -10,8 +10,14 @@ from nats.aio.msg import Msg
 from nats.errors import NoRespondersError
 
 from .env import get_env_var, load_env
-from .inflow_v1 import actions_handler, intro_handler, meta_func_handler, settings_handler
-from .models import Action, Meta, PluginIntro, Settings, marshal
+from .inflow_v1 import (
+    actions_handler,
+    intro_handler,
+    meta_func_handler,
+    settings_handler,
+    signals_handler,
+)
+from .models import Action, Meta, PluginIntro, Settings, Signal, SignalHandler, marshal
 from .nats_box import NatsBox
 
 # DefaultSendTimeout is the NATS request/reply deadline for send when the plugin
@@ -37,6 +43,8 @@ class Plugin:
         self.settings_data: Optional[Settings] = None
         self.actions: list[Action] = []
         self.meta_fn: list[Meta] = []
+        # The signal-port handler registered with on_signal(); None = not listening.
+        self.signal_fn: Optional[SignalHandler] = None
         self.send_timeout: float = DEFAULT_SEND_TIMEOUT
         # In-flight handler tasks. Handlers run off the NATS dispatch coroutine (see
         # inflow_v1.py) so concurrent calls to one subject don't serialize; asyncio
@@ -60,6 +68,34 @@ class Plugin:
         a synchronous RPC on inflow.v1.<PLUGIN_ID>.<Method>; call it before start."""
         self.meta_fn.extend(meta)
 
+    def on_signal(self, handler: Optional[SignalHandler] = None) -> None:
+        """Register the handler for the plugin's signal port — every subject under
+        `inflow.plugin.<PLUGIN_ID>.>`, the runtime's one-way broadcast channel about
+        processes this plugin is running (see Signal). Call it before start(), which
+        does the subscribing; passing None registers a handler that only logs what
+        arrives, which is enough to watch the port during development.
+
+        It is entirely OPTIONAL. A plugin that never calls it behaves exactly as
+        before, and that is the norm: when a process is stopped or times out, the job
+        the plugin took on deliberately keeps running, because a later process may
+        pick up where it left off — the runtime hands the previous jobId back in
+        `_registry`, so progress made after the stop is not wasted. Register a handler
+        only for the cases where the work itself must also stop: a stream to close, an
+        upstream call to abort, a reservation to release. Then test
+        canceled(sig.conclusion) and cancel the work you filed under sig.job_id.
+
+        Only the last registered handler is kept. Handlers run in their own task, so
+        signals for different jobs may overlap, and an exception inside one is caught
+        and logged rather than taking the plugin down.
+
+        Mirrors Go's Plugin.OnSignal."""
+        if handler is None:
+
+            def handler(sig: Signal) -> None:  # noqa: F811 - default logger
+                print(f"signal on {sig.subject} received: {sig.data.decode(errors='replace')}")
+
+        self.signal_fn = handler
+
     # ---- payloads ---------------------------------------------------------
 
     def intro_payload(self) -> bytes:
@@ -82,6 +118,7 @@ class Plugin:
         await settings_handler(self)
         await actions_handler(self)
         await meta_func_handler(self)
+        await signals_handler(self)
 
     def get_plugin_id(self) -> str:
         return self.plugin_id

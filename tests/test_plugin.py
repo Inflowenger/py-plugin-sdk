@@ -1,20 +1,31 @@
 """Subject wiring, reply payloads, the job handshake, and the no-throw send."""
+import asyncio
 import json
 
 import pytest
 
 from inflow_plugin_sdk import (
     Action,
+    Conclusion,
     Frame,
     Job,
     Meta,
     PluginIntro,
+    PluginSignal,
     Request,
     Response,
     Settings,
+    canceled,
+    succeeded,
 )
 
 from conftest import MockMsg
+
+
+async def _drain() -> None:
+    """Let detached handler tasks (job handlers, signal handlers) run to completion."""
+    for _ in range(5):
+        await asyncio.sleep(0)
 
 
 async def test_start_wires_all_subjects(plugin, conn):
@@ -71,6 +82,9 @@ async def test_action_handshake_and_job_commands(plugin, conn):
 
     m = MockMsg(data=json.dumps({"_registry": {}, "body": {}}).encode())
     await conn.subs["inflow.cpu.PID.act"](m)
+    # The handler runs in a detached task so it cannot head-of-line-block the
+    # subscription (see with_job_handler); yield until it has finished.
+    await _drain()
 
     # the request is acked with the minted jobId
     ack = json.loads(m.responses[0])
@@ -122,22 +136,95 @@ async def test_raising_action_handler_reports_done_with_error(plugin, conn):
     m = MockMsg(data=b"{}")
     # Must not raise out of the dispatch callback — the plugin keeps running.
     await conn.subs["inflow.cpu.PID.act"](m)
+    await _drain()  # the handler runs detached; let it report the failure
 
     # The request was still acked with a jobId...
     ack = json.loads(m.responses[0])
     assert "jobId" in ack
 
     # ...and the failure was reported to the runtime as a terminal DoneWithError
-    # (progress 100, reason on the canonical "error" detail), not swallowed.
+    # (progress 100, reason on the command's own "error" field), not swallowed.
     assert len(conn.requests) == 1
     sub, body = conn.requests[0]
     assert sub == f"inflow.cpu.PID.{ack['jobId']}.progress"
     payload = json.loads(body)
     assert payload["progress"] == 100
-    assert payload["details"]["error"] == "handler exploded"
+    assert payload["error"] == {"code": 0, "message": "handler exploded"}
+    # The reason is no longer a detail: the panic commits nothing.
+    assert payload["details"] is None
 
 
 async def test_cmd_svc_call_unserializable_data_returns_error_not_raise(plugin):
     job = Job(plugin, "act", "jid", Request(data=b""))
     result = await job.cmd_svc_call("svc", data=object())  # object() is not JSON-able
     assert isinstance(result, Exception)
+
+
+# ---- the signal port -------------------------------------------------------
+#
+# A signal is a publish, not a request: nothing on the wire tells the plugin it
+# mis-read one. So what is checked here is that the port stays opt-in, that the kind
+# is the subject past the plugin's own prefix, that the runtime's {conclusion, jobId}
+# body lands in the typed fields — and the case that has no answer yet: a future kind
+# with a payload this SDK does not model still reaches the handler, bytes intact.
+
+
+async def test_signal_port_is_opt_in(plugin, conn):
+    plugin.add_action(Action(method="act", request_handler=lambda job: None))
+    await plugin.start()
+    assert "inflow.plugin.PID.>" not in conn.subs
+
+
+async def test_on_signal_subscribes_and_parses_proc(plugin, conn):
+    seen = []
+    plugin.on_signal(lambda sig: seen.append(sig))
+    await plugin.start()
+
+    assert "inflow.plugin.PID.>" in conn.subs
+
+    await conn.subs["inflow.plugin.PID.>"](
+        MockMsg(
+            subject="inflow.plugin.PID.proc",
+            data=b'{"conclusion":"flow_stop_by_user","jobId":"job-1"}',
+        )
+    )
+    await _drain()
+
+    assert len(seen) == 1
+    sig = seen[0]
+    assert sig.kind == PluginSignal.PROC
+    assert sig.job_id == "job-1"
+    assert sig.conclusion == Conclusion.FLOW_STOP_BY_USER
+    assert canceled(sig.conclusion) and not succeeded(sig.conclusion)
+    # a signal is a publish — the SDK must not reply to it
+    assert sig.msg.responses == []
+
+
+async def test_signal_of_unmodelled_kind_keeps_its_payload(plugin, conn):
+    seen = []
+    plugin.on_signal(lambda sig: seen.append(sig))
+    await plugin.start()
+
+    await conn.subs["inflow.plugin.PID.>"](
+        MockMsg(subject="inflow.plugin.PID.future.kind", data=b"not json")
+    )
+    await _drain()
+
+    sig = seen[0]
+    assert sig.kind == "future.kind"  # the whole subject remainder
+    assert sig.data == b"not json"
+    assert sig.job_id == "" and sig.conclusion == ""
+
+
+async def test_failing_signal_handler_does_not_break_the_port(plugin, conn):
+    def boom(sig):
+        raise RuntimeError("signal handler exploded")
+
+    plugin.on_signal(boom)
+    await plugin.start()
+
+    # Must not raise out of the dispatch callback — the plugin keeps serving.
+    await conn.subs["inflow.plugin.PID.>"](
+        MockMsg(subject="inflow.plugin.PID.proc", data=b'{"conclusion":"done"}')
+    )
+    await _drain()

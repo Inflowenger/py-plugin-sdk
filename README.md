@@ -76,6 +76,41 @@ See `examples/rpc.py` and `examples/http_call.py` (the ports of `TestCommands` /
 `TestInit` in `sdkv1_test.go`). Copy `.env.inflow.example` to `.env.inflow` and
 fill in the values Infra minted for your plugin.
 
+## Signals — knowing a process ended (`on_signal`)
+
+The runtime broadcasts on `inflow.plugin.<PLUGIN_ID>.proc` whenever a plugin node
+process ends, saying which job it was and how it ended: `done`, `flow_stop_by_user`,
+`timeout`, and so on. `p.on_signal(handler)` — registered **before `start()`** —
+subscribes to that port (`inflow.plugin.<PLUGIN_ID>.>`, so future signal kinds reach
+the same handler).
+
+```python
+from inflow_plugin_sdk import Signal, canceled
+
+inflight: dict[str, asyncio.Task] = {}
+
+def on_signal(sig: Signal) -> None:
+    if not canceled(sig.conclusion):      # done / next / failed: nothing to abort
+        return
+    task = inflight.pop(sig.job_id, None) # sig.job_id == the job.job_id you were given
+    if task is not None:
+        task.cancel()
+
+p.on_signal(on_signal)                    # p.on_signal() alone just logs the port
+```
+
+**This is optional, and ignoring it is a valid choice.** A stopped process does not
+stop the job: that is on purpose, because the next process on the same node may build
+on the progress this one made — the runtime hands the previous `jobId` back in
+`_registry`. Register a handler only where the work itself must not outlive the
+process: a stream to close, an upstream call to abort, a reservation to release.
+
+Two things to keep in mind: a signal also arrives on **success** (filter on
+`sig.conclusion`, with `canceled()` / `succeeded()` or the `Conclusion` enum), and by
+the time it lands the runtime no longer answers that job's commands — wind the work
+down, do not try to report it. Handlers run in their own task, so a slow one does not
+stall the port, and an exception inside one is caught and logged.
+
 ## Forms
 
 `formkit` builds an action's JSON Schema + JSON Forms UI Schema from one
@@ -94,5 +129,8 @@ form = formkit.form("Create issue").add(
 p.add_action(Action(method="jira.issue.create", form=form, request_handler=...))
 ```
 
-The protocol docs (`docs/`) are language-agnostic and shared with the Go and Node
-SDKs.
+The protocol docs are language-agnostic and shared with the Go and Node SDKs — see
+[protocol-inflowv1.md](https://github.com/Inflowenger/go-plugin-sdk/blob/main/docs/protocol-inflowv1.md)
+(subjects, payloads, the signal port) and
+[jobs-and-commands.md](https://github.com/Inflowenger/go-plugin-sdk/blob/main/docs/jobs-and-commands.md)
+(the `Job` API and `OnSignal`/`on_signal` in depth).

@@ -166,6 +166,21 @@ class Frame:
 
 
 @dataclass
+class ErrorPayload:
+    """How a terminal command reports a failure. Its presence — not its contents —
+    is the verdict: the core concludes the job failed whenever the field is there,
+    even with an empty message.
+
+    `code` is the plugin's own error number, in the plugin's own numbering. The core
+    does not interpret it or map it onto a fractal status; it carries it so the
+    plugin's owner can be asked what it means. Leave it 0 when the plugin has no
+    such numbering. Mirrors Go's ErrorPayload."""
+
+    code: int = field(default=0, metadata=_wire("code"))
+    message: str = field(default="", metadata=_wire("message"))
+
+
+@dataclass
 class CommandPayload:
     """Payload of a `progress` command. Mirrors Go's CommandPayload."""
 
@@ -173,6 +188,9 @@ class CommandPayload:
     frame: Frame = field(default_factory=Frame, metadata=_wire("frame"))
     details: Optional[dict[str, Any]] = field(default=None, metadata=_wire("details"))
     commit_on: str = field(default="", metadata=_wire("commit_on"))
+    # Set only by the done_with_error family, and what makes a finished job a
+    # failed one — details is still committed either way.
+    error: Optional[ErrorPayload] = field(default=None, metadata=_wire("error", omitempty=True))
 
 
 @dataclass
@@ -227,3 +245,39 @@ class CallSvcBody:
 
     data: Any = field(default=None, metadata=_wire("data"))
     op: Optional[dict[str, Any]] = field(default=None, metadata=_wire("op"))
+
+
+@dataclass
+class Signal:
+    """One runtime message on the plugin's signal port,
+    `inflow.plugin.<PLUGIN_ID>.<KIND>` — a broadcast OUT of the runtime about a
+    process, not a request: nothing is expected back and no reply is read.
+
+    Today the only kind is PluginSignal.PROC, published when the runtime finishes
+    with a plugin node process; the port is a wildcard subscription, so future kinds
+    arrive at the same handler with a different `kind` and, possibly, a payload this
+    class does not model — hence `data`. Not serialized to the wire. Mirrors Go's
+    Signal."""
+
+    # The subject remainder after `inflow.plugin.<PLUGIN_ID>.`, e.g. "proc". Switch
+    # on it before trusting the parsed fields below.
+    kind: str = ""
+    # The full NATS subject the signal arrived on.
+    subject: str = ""
+    # The job this signal is about — the very uuid the SDK minted in the
+    # request->job handshake and handed to the handler as Job.job_id, so a plugin can
+    # match a signal to the work it still has in flight.
+    job_id: str = ""
+    # How the runtime ended that process. Set for "proc" signals; empty for a kind
+    # that carries no conclusion.
+    conclusion: str = ""
+    # The raw payload, kept verbatim so an unmodelled future kind is still readable.
+    data: bytes = b""
+    # The underlying NATS message (headers, subject, reply). Present for the escape
+    # hatch; a signal is a publish, so do not respond to it.
+    msg: Optional["Msg"] = None
+
+
+# A handler for every message landing on the plugin's signal port. Registered with
+# Plugin.on_signal. Mirrors Go's SignalHandler.
+SignalHandler = Callable[["Signal"], Awaitable[None] | None]

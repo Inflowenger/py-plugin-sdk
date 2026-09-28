@@ -7,6 +7,7 @@ from .models import (
     ActionRequestContent,
     CallSvcBody,
     CommandPayload,
+    ErrorPayload,
     FormBuilder,
     Frame,
     Icon,
@@ -20,6 +21,8 @@ from .models import (
     RequestBody,
     Response,
     Settings,
+    Signal,
+    SignalHandler,
     marshal,
 )
 from .nats_box import NatsBox
@@ -34,7 +37,7 @@ from .plugin import (
     with_timeout,
 )
 from .req import ActionRequest, cast_request_to, with_job_handler
-from .types import Command
+from .types import Command, Conclusion, PluginSignal, canceled, succeeded
 
 __all__ = [
     # plugin
@@ -53,6 +56,10 @@ __all__ = [
     "with_job_handler",
     # types
     "Command",
+    "PluginSignal",
+    "Conclusion",
+    "succeeded",
+    "canceled",
     "NatsBox",
     # models
     "IPlugin",
@@ -66,12 +73,15 @@ __all__ = [
     "Meta",
     "Frame",
     "CommandPayload",
+    "ErrorPayload",
     "JobBodyContent",
     "Response",
     "Request",
     "RequestBody",
     "ActionRequestContent",
     "CallSvcBody",
+    "Signal",
+    "SignalHandler",
     "marshal",
     # formkit (optional form builder)
     "formkit",

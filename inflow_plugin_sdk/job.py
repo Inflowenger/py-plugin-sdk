@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from .models import CallSvcBody, CommandPayload, Frame, IPlugin, JobBodyContent, Request, marshal
+from .models import CallSvcBody, CommandPayload, ErrorPayload, Frame, IPlugin, JobBodyContent, Request, marshal
 from .types import Command
 
 
@@ -22,22 +22,39 @@ class Job:
         )
 
     async def done_with_error(self, error: str) -> Any:
-        """End the job as failed, reporting the reason as its only detail."""
-        return await self.done_with_error_data(error, None)
+        """End the job as failed, reporting `error` as the reason.
+
+        The reason no longer travels as a detail: it goes in CommandPayload.error, its
+        own field on the terminal command, and details is left untouched. So the job
+        commits nothing and the flow sees a failure with a message."""
+        return await self.done_with_error_code(0, error, None)
 
     async def done_with_error_data(self, error: str, data: Optional[dict[str, Any]], *key: str) -> Any:
         """End the job as failed exactly like done_with_error, but keep a payload:
-        `data` is reported (and committed, at `key` when given) next to the reason,
-        which always lands on the canonical "error" detail — so a key named "error"
-        inside `data` is overwritten. Use it when the failure still carries state
-        the flow needs: a terminal command's details ARE what gets committed onto
-        the node's scope, so a bare done_with_error drops anything the node had
-        persisted there. Hand it back through `data` to keep it."""
-        details: dict[str, Any] = dict(data or {})
-        details["error"] = error
+        `data` is reported (and committed, at `key` when given) alongside the reason.
+        Nothing in `data` is reserved — the reason rides on its own field, so a key
+        named "error" is now the plugin's to use.
+
+        Use it when the failure still carries state the flow needs: a terminal
+        command's details ARE what gets committed onto the node's scope, so a bare
+        done_with_error commits nothing and drops anything the node had persisted
+        there. Hand it back through `data` to keep it."""
+        return await self.done_with_error_code(0, error, data, *key)
+
+    async def done_with_error_code(
+        self, code: int, error: str, data: Optional[dict[str, Any]], *key: str
+    ) -> Any:
+        """done_with_error_data with the plugin's own error number attached. `code`
+        belongs to the plugin's numbering — the core carries it next to the message
+        and never interprets it — so pass 0 when the plugin has none."""
         return await self.command(
             Command.PROGRESS,
-            CommandPayload(progress=100, details=details, commit_on=".".join(key)),
+            CommandPayload(
+                progress=100,
+                details=data,
+                commit_on=".".join(key),
+                error=ErrorPayload(code=code, message=error),
+            ),
         )
 
     async def progress(self, progress_percent: int, step: Frame) -> Any:

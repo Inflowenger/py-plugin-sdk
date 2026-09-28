@@ -1,10 +1,13 @@
 # Subject wiring: intro / settings / actions / forms / meta. Mirrors sdkv1/inflowV1.go.
 from __future__ import annotations
 
+import asyncio
 import inspect
 import uuid
 
-from .models import Request, marshal
+import json
+
+from .models import Request, Signal, marshal
 from .req import ActionRequest, with_job_handler
 
 
@@ -35,6 +38,11 @@ def make_action_cpu(plugin_id: str, action: str) -> str:
 
 def make_form_subject(plugin_id: str, action: str) -> str:
     return f"inflow.v1.{plugin_id}.{action}.@form"
+
+
+def make_signal_subject(plugin_id: str) -> str:
+    # inflow.plugin.<PLUGIN_ID>.> — the wildcard signal port (every signal kind).
+    return f"inflow.plugin.{plugin_id}.>"
 
 
 # ---- handlers -------------------------------------------------------------
@@ -178,3 +186,60 @@ async def meta_func_handler(p) -> None:
 
         await conn.subscribe(make_action_subject(p.plugin_id, meta.method), cb=make_cb(meta))
         print(f"Meta Function Service : {make_action_subject(p.plugin_id, meta.method)}")
+
+
+def parse_signal(plugin_id: str, msg) -> Signal:
+    """Turn a raw signal message into a Signal: `kind` is whatever the subject
+    carries past the plugin's prefix, and a payload that parses as the runtime's
+    `{conclusion, jobId}` body fills the typed fields. A payload that does not parse
+    is not an error — an unmodelled future kind still reaches the handler with its
+    bytes intact. Mirrors Go's parseSignal."""
+    prefix = f"inflow.plugin.{plugin_id}."
+    sig = Signal(
+        kind=msg.subject[len(prefix):] if msg.subject.startswith(prefix) else msg.subject,
+        subject=msg.subject,
+        data=msg.data,
+        msg=msg,
+    )
+    try:
+        body = json.loads(msg.data.decode())
+    except Exception:
+        return sig  # an unmodelled kind: leave the typed fields empty, keep data
+    if isinstance(body, dict):
+        sig.job_id = body.get("jobId") or ""
+        sig.conclusion = body.get("conclusion") or ""
+    return sig
+
+
+async def signals_handler(p) -> None:
+    """Subscribe the registered signal handler (Plugin.on_signal) to the whole signal
+    port, `inflow.plugin.<PLUGIN_ID>.>`. A plugin that never called on_signal
+    subscribes to nothing — the port is opt-in. Mirrors Go's signalsHandler."""
+    handler = p.signal_fn
+    if handler is None:
+        return
+    conn = p.infra_conn.get_connection()
+    if conn is None:
+        raise RuntimeError("connection error occurred")
+
+    async def cb(msg):
+        sig = parse_signal(p.plugin_id, msg)
+
+        async def body():
+            try:
+                await _maybe_await(handler(sig))
+            except Exception as e:
+                # nats-py delivers one subscription's messages serially, so a slow
+                # handler (closing a stream, aborting an upstream call) would stall
+                # the signals behind it — hence the detached task — and an escaping
+                # exception must not kill the subscription.
+                print(f"signal handler failed on {sig.subject}: {e}")
+
+        task = asyncio.create_task(body())
+        # asyncio only keeps a weak reference to a bare task; hold a strong one on
+        # the plugin so the loop cannot collect it mid-flight.
+        p.jobs.add(task)
+        task.add_done_callback(p.jobs.discard)
+
+    await conn.subscribe(make_signal_subject(p.plugin_id), cb=cb)
+    print(f"Signals Subscribed on : {make_signal_subject(p.plugin_id)}")

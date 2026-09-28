@@ -8,9 +8,10 @@ from inflow_plugin_sdk import Plugin
 
 
 class MockMsg:
-    def __init__(self, data: bytes = b"", headers=None):
+    def __init__(self, data: bytes = b"", headers=None, subject: str = ""):
         self.data = data
         self.headers = headers
+        self.subject = subject
         self.responses: list[bytes] = []
 
     async def respond(self, data: bytes) -> None:
