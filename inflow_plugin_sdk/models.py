@@ -131,6 +131,11 @@ class Action:
     tags: dict[str, str] = field(default_factory=dict, metadata=_wire("tags", omitempty=True))
     # Not serialized to the wire (Go marks it `json:"-"`).
     request_handler: Optional[JobHandler] = field(default=None, metadata=_wire(skip=True))
+    # The action's own middleware functions, run in order after the plugin's
+    # (Plugin.use) and before the job is accepted — a plain list, or built with
+    # use(fn, ...); see middleware.MiddlewareFunc. Optional, and not serialized
+    # (a function is not JSON).
+    middleware: list = field(default_factory=list, metadata=_wire(skip=True))
 
 
 @dataclass

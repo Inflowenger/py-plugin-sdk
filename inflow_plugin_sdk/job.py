@@ -3,16 +3,52 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from .context import JobContext, background
 from .models import CallSvcBody, CommandPayload, ErrorPayload, Frame, IPlugin, JobBodyContent, Request, marshal
 from .types import Command
 
 
 class Job:
-    def __init__(self, plugin: IPlugin, action: str, job_id: str, req: Request):
+    def __init__(
+        self,
+        plugin: IPlugin,
+        action: str,
+        job_id: str,
+        req: Request,
+        ctx: Optional[JobContext] = None,
+    ):
         self.plugin = plugin
         self.action = action
         self.job_id = job_id
         self.req = req
+        self._ctx = ctx
+
+    def context(self) -> JobContext:
+        """The job's context: the one its middleware passed down (see
+        MiddlewareFunc), carrying the jobId (job_id_from_context) and whatever
+        the middleware bound to it, and ended by the SDK when the handler
+        returns. A job built by hand — and one from an action with no
+        middleware — answers the background context, which is never cancelled,
+        so a handler may call this unconditionally.
+
+        Like an http.Request's, it lives as long as the handler: work the handler
+        leaves running after it returns must not hold it — derive that work's
+        context with ctx.without_cancel(), which keeps the values (a trace) and
+        drops the cancellation."""
+        return self._ctx if self._ctx is not None else background()
+
+    def with_context(self, ctx: JobContext) -> "Job":
+        """A copy of the job carrying `ctx` as its context(). The SDK uses it to
+        hand a handler what its middleware passed down; a handler can use it to
+        pass a narrowed context along with the job."""
+        return Job(self.plugin, self.action, self.job_id, self.req, ctx)
+
+    def with_job_id(self, job_id: str) -> "Job":
+        """A copy of the job named `job_id`. The SDK uses it to keep Job.job_id
+        in step with the id bound to the context after each middleware function;
+        a handler has no reason to call it — renaming an accepted job would
+        address its commands to a job the runtime does not know."""
+        return Job(self.plugin, self.action, job_id, self.req, self._ctx)
 
     async def done(self, data: dict[str, Any], *key: str) -> Any:
         """Complete the job (progress 100) and emit `data` as this node's output."""

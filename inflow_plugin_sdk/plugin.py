@@ -17,6 +17,7 @@ from .inflow_v1 import (
     settings_handler,
     signals_handler,
 )
+from .middleware import MiddlewareFunc, job_id, use
 from .models import Action, Meta, PluginIntro, Settings, Signal, SignalHandler, marshal
 from .nats_box import NatsBox
 
@@ -46,6 +47,12 @@ class Plugin:
         # The signal-port handler registered with on_signal(); None = not listening.
         self.signal_fn: Optional[SignalHandler] = None
         self.send_timeout: float = DEFAULT_SEND_TIMEOUT
+        # The middleware function every request runs first, naming the job; None
+        # means middleware.job_id. See with_job_id.
+        self.job_id_fn: Optional[MiddlewareFunc] = None
+        # Middleware that runs on every action's requests, after job_id_fn and
+        # before the action's own. See use().
+        self.middlewares: list[MiddlewareFunc] = []
         # In-flight handler tasks. Handlers run off the NATS dispatch coroutine (see
         # inflow_v1.py) so concurrent calls to one subject don't serialize; asyncio
         # only holds a weak reference to a bare create_task, so we keep a strong one
@@ -67,6 +74,18 @@ class Plugin:
         """Register one or more meta methods (see the Meta type). Each is served as
         a synchronous RPC on inflow.v1.<PLUGIN_ID>.<Method>; call it before start."""
         self.meta_fn.extend(meta)
+
+    def use(self, *fns: Optional[MiddlewareFunc]) -> None:
+        """Add middleware functions that run on the requests of every action, in
+        the order given — after the job's namer, before each action's own
+        Action.middleware. Call it before start(). Mirrors Go's Plugin.Use."""
+        self.middlewares.extend(use(*fns))
+
+    def pipeline(self, action: Action) -> list[MiddlewareFunc]:
+        """The middleware a request of `action` runs, in order: the job's namer,
+        the plugin's, then the action's own."""
+        namer = self.job_id_fn or job_id
+        return [namer, *self.middlewares, *use(*(action.middleware or []))]
 
     def on_signal(self, handler: Optional[SignalHandler] = None) -> None:
         """Register the handler for the plugin's signal port — every subject under
@@ -214,6 +233,19 @@ def with_infra_connection(infra_url: str, credential: str):
 
     async def opt(p: Plugin) -> None:
         p.infra_conn = await NatsBox.create(credential, infra_url)
+
+    return opt
+
+
+def with_job_id(namer: MiddlewareFunc):
+    """Replace the default namer as the middleware function every request runs
+    first, for a plugin that names its jobs its own way. It must bind the id with
+    with_job_id_context — the SDK takes Job.job_id from there — since everything
+    after it keys on the jobId; a request it leaves unnamed is rejected. Mirrors
+    Go's WithJobID."""
+
+    def opt(p: Plugin) -> None:
+        p.job_id_fn = namer
 
     return opt
 

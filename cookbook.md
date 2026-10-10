@@ -17,7 +17,11 @@ language-agnostic and live in the Go repo:
 [inflowv1 protocol](https://github.com/Inflowenger/go-plugin-sdk/blob/main/docs/protocol-inflowv1.md) ·
 [jobs & commands](https://github.com/Inflowenger/go-plugin-sdk/blob/main/docs/jobs-and-commands.md) ·
 [form builder](https://github.com/Inflowenger/go-plugin-sdk/blob/main/docs/form-builder.md) ·
+[external job identity](https://github.com/Inflowenger/go-plugin-sdk/blob/main/docs/external-job-identity.md) ·
+[detached work](https://github.com/Inflowenger/go-plugin-sdk/blob/main/docs/detached-work.md) ·
 [examples](https://github.com/Inflowenger/go-plugin-sdk/blob/main/docs/examples.md).
+Those docs are written in Go, but the protocol and the design are identical — Skills
+12–14 below carry the Python form of everything in the last three.
 
 Also worth keeping open: the **[plugin catalog](https://github.com/Inflowenger/plugin-catalog)** — the developer
 knowledge base ([concepts](https://github.com/Inflowenger/plugin-catalog/blob/main/docs/concepts.md) ·
@@ -482,7 +486,7 @@ p.required_params(Settings(
 
 ---
 
-## Skill 12 — React when a process ends (signals, optional)
+## Skill 12 — Stop a job when its flow is stopped (signals + `jobstop`)
 
 The runtime broadcasts on `inflow.plugin.<PLUGIN_ID>.proc` every time a plugin node
 process ends — with the `job_id` and a conclusion (`done`, `flow_stop_by_user`,
@@ -496,58 +500,275 @@ p.on_signal(lambda sig: print(f"job {sig.job_id} ended: {sig.conclusion}"))
 **Skip this skill unless you need it.** A stopped or timed-out process does *not*
 stop the job you accepted, by design: the next run of that node may build on the
 progress this one made — the runtime hands the previous `jobId` back in `_registry`.
-Only reach for `on_signal` when the work itself must die with the process: an open
-stream, a paid upstream call, a held lock.
+Only reach for it when the work itself must die with the process: an open stream, a
+paid upstream call, a held lock.
 
 The working pattern is to file the cancel under the `job_id` and let the signal find
-it:
+it. `jobstop` is that, as a capability you add to the actions that need it — a
+middleware on the action, a signal handler on the port:
 
 ```python
-import asyncio
-from inflow_plugin_sdk import Action, Job, Signal, canceled
+from inflow_plugin_sdk import Action, Job, jobstop
 
-inflight: dict[str, asyncio.Task] = {}
-
-
-def on_signal(sig: Signal) -> None:
-    if not canceled(sig.conclusion):        # done / next / failed: nothing to abort
-        return
-    task = inflight.pop(sig.job_id, None)   # sig.job_id == the job.job_id you were given
-    if task is not None:
-        task.cancel()
-
-
-p.on_signal(on_signal)                      # p.on_signal() alone just logs the port
+stops = jobstop.Registry()        # one per plugin
+p.on_signal(stops.on_signal)      # before start()
 
 
 async def long_export(job: Job) -> None:
-    task = asyncio.create_task(fetch_everything())
-    inflight[job.job_id] = task
+    ctx = job.context()                       # ends when the flow is stopped
     try:
-        await job.done({"rows": await task})
-    except asyncio.CancelledError:
-        return                              # abandoned: wind down, don't report
+        rows = await ctx.run(fetch_everything())   # the awaited work is cancelled with it
+    except jobstop.JobStopped:
+        return                                # the runtime is gone: do NOT report
     except Exception as e:
         await job.done_with_error(str(e))
-    finally:
-        inflight.pop(job.job_id, None)
+        return
+    await job.done({"rows": rows})
 
 
-p.add_action(Action(method="long.export", request_handler=long_export))
+p.add_action(Action(
+    method="long.export",
+    middleware=[stops.middleware],            # only on actions that stop with the flow
+    request_handler=long_export,
+))
+```
+
+Middleware runs before the runtime is told the jobId, so a stop can never arrive for
+a job not yet filed. A middleware is a plain function —
+`(ctx: JobContext, job: Job) -> JobContext | None` — so your own capabilities (a
+long-running job kept in your own dict, a trace) are middleware too, listed in order:
+`middleware=use(trace, stops.middleware)` on an action, `p.use(trace)` on every
+action, `chain_signals(stops.on_signal, yours)` on the port. An exception from one
+rejects the request.
+
+`job.context()` is a `JobContext` — the Python stand-in for Go's `context.Context`:
+
+| What you want | Call |
+|---|---|
+| Abandon an awaited call when the job is stopped | `await ctx.run(coro)` — raises the cause |
+| Ask whether the job was cut short, and why | `ctx.canceled` · `ctx.cause` (e.g. `jobstop.ErrStopped`) |
+| Poll without pinning a stopped job | `await ctx.sleep(2)` → `False` if it ended |
+| Wait for the stop itself | `await ctx.wait_canceled()` |
+| Clean up however the job ends | `ctx.on_done(lambda cause: …)` |
+| Carry a value down the chain | `ctx.with_value(k, v)` / `ctx.value(k)` |
+| Keep work alive past the handler | `ctx.without_cancel()` |
+| Put a deadline on one step | `ctx, cancel = ctx.with_timeout(5)` |
+
+`ctx.run` is the Python answer to Go's "pass ctx down": a Python library takes no
+context, so `run` puts the awaitable in a task and cancels *that* when the job is
+stopped. A polling loop uses `sleep` instead:
+
+```python
+async def observe(job: Job) -> None:
+    ctx = job.context()
+    while True:
+        status = await poll()
+        if status.done:
+            break
+        await job.progress(status.percent, Frame(title="Upstream", content=status.stage))
+        if not await ctx.sleep(2):   # False ⇒ the flow was stopped
+            return                   # wind down quietly; do not report
+    await job.done({"result": status.result})
 ```
 
 Gotchas:
 
-- Signals arrive on **success too** — always filter on `sig.conclusion`
-  (`canceled()` / `succeeded()`, or the `Conclusion` enum).
-- When the signal lands the runtime has already stopped listening to that job, so an
-  abandoned handler's `progress`/`done` will find no responder. Wind down quietly.
-- Handlers run in their own task (Go's "own goroutine"), so a slow one does not
-  stall the port and an exception inside one is caught and logged; only the last one
-  registered is kept.
+- Cancellation is **per `job_id`**. One subject carries every signal of the plugin, so
+  a process hears the endings of other flows' jobs (and other replicas'); those find
+  nothing filed and do nothing.
+- Signals arrive on **success too** — `stops.on_signal` filters on
+  `canceled(sig.conclusion)`; a handler of your own should too.
+- When a stop lands the runtime has already stopped listening to that job, so a
+  stopped handler's `progress`/`done` will find no responder. Wind down quietly.
+- **A cancellation raises.** `ctx.run` raises `jobstop.JobStopped` out of the handler.
+  The SDK will not report a handler that raises while its context is already cancelled
+  (it logs instead), but catch it yourself where you have cleanup to do.
+- Handlers run in their own task (Go's "own goroutine"), so a slow one does not stall
+  the port and an exception inside one is caught and logged; only the last one
+  registered is kept — compose several with `chain_signals`.
+- Registering your own handler replaces the logging `p.on_signal()` gives you. Chain
+  `log_signals("<plugin>")` to keep a line per signal that arrives:
+  `p.on_signal(chain_signals(log_signals("my-plugin"), stops.on_signal))`. `jobstop`
+  logs the other half — the job it actually cancelled — so a signal with no cancel line
+  beside it was not about work this process is running.
+- `stops.cancel_all()` cancels every job the registry holds (cause
+  `jobstop.ErrShutdown`), for a plugin about to exit. It sends nothing to the runtime.
 
 Full treatment:
 [jobs-and-commands.md § Signals](https://github.com/Inflowenger/go-plugin-sdk/blob/main/docs/jobs-and-commands.md#signals--when-the-runtime-ends-a-process).
+
+---
+
+## Skill 13 — Run the job under an external service's id (advanced)
+
+When your plugin is a **middleman** for a service that names work itself — Joern's
+HTTP server answering `POST /query` with `{"queryId":"q-8f21"}`, a render farm, a
+scan — do not keep a `dict[plugin_job_id, upstream_id]`. Register the work in a
+middleware function and bind what came back as the job's id: middleware runs **before**
+the job is accepted, so the id you bind is the id the runtime is told.
+
+Why the dict is the wrong answer, briefly: it has a window where the job is accepted
+but not yet mapped (a stop then finds nothing); it dies with the process, so a
+redeploy orphans every upstream query; and signals are broadcast to **every** replica,
+so the process that hears the stop is usually not the one holding the entry. One
+shared name removes all three.
+
+```python
+from inflow_plugin_sdk import Job, JobContext, cast_request_to, use, with_job_id_context
+
+
+async def register_query(ctx: JobContext, job: Job) -> JobContext:
+    body = cast_request_to(job.req.data)        # raises ⇒ the request is rejected
+    # Re-running? The previous jobId IS the upstream id — reattach, don't duplicate.
+    prev = (body.registry or {}).get("jobId")
+    if prev and await joern.alive(prev):
+        return with_job_id_context(ctx, prev)
+
+    query_id = await joern.register(body.body["project"], body.body["query"])
+    if len(query_id) < 10:                      # see the gotchas
+        await joern.cancel(query_id)            # never accepted: undo it
+        raise ValueError(f"jobId {query_id} from joern is shorter than 10 characters")
+    return with_job_id_context(ctx, query_id)
+
+
+p.on_signal(chain_signals(stops.on_signal, abort_upstream))
+p.add_action(Action(
+    method="cpg.query",
+    middleware=use(register_query, stops.middleware),   # namer FIRST
+    request_handler=query_handler,
+))
+```
+
+From then on one name serves both systems: `job.job_id`, every command subject
+(`inflow.cpu.<id>.q-8f21.progress`), the stop signal's `job_id`, and the next run's
+`_registry["jobId"]`. Cancellation needs no local lookup at all —
+
+```python
+async def abort_upstream(sig: Signal) -> None:
+    if sig.kind != PluginSignal.PROC or not canceled(sig.conclusion):
+        return
+    await joern.cancel(sig.job_id)   # sig.job_id IS the queryId
+```
+
+— so any replica that hears the stop can abort the query, which a process-local dict
+could never do.
+
+Gotchas:
+
+- **Name the job first.** `stops.middleware` (and anything else keyed on the jobId)
+  files under `job.job_id` *as of when it runs*; placed before the namer it files a
+  uuid nothing will look up, and the stop is lost.
+- **Validate the id you adopt.** It must be **at least 10 characters** —
+  fractal-core refuses a shorter `jobId` with `init failed. invalid job ID` — a usable
+  NATS subject token (no `.`, space, `*`, `>`, since the command subjects are built
+  from it), and unique plugin-wide (prefix per-project counters).
+- **Register fast.** The runtime is waiting for the jobId while middleware runs — one
+  timeout-bounded call, never the work itself. 15 seconds is the whole budget.
+- **Reject vs fail**: an exception from middleware means the node never ran (the
+  runtime gets the error, not a failed job). When the flow should *see* a failed node,
+  accept and use `job.done_with_error`.
+- **Undo what you enlisted.** If a later function rejects, the job's context ends —
+  register the compensation with
+  `ctx.on_done(lambda _cause: asyncio.ensure_future(joern.cancel(query_id)))` (a
+  coroutine function passed to `on_done` is scheduled for you) and it runs without any
+  special casing.
+- If the service accepts a **client-supplied** id instead, do the mirror image: keep
+  the SDK's uuid and send `job.job_id` upstream — same single name, and the
+  registration becomes idempotent by construction.
+
+What it buys, stated as invariants: accepted ⇒ enlisted (the namer ran first);
+enlisted ⇒ nameable (the id came from the service, so it survives a restart);
+rejected ⇒ compensated or never enlisted; any stop is actionable by any replica; and
+a crash is recoverable, because the id lives in the flow's own `_registry` rather than
+in this process's memory.
+
+Full treatment, with the distributed-transaction model and the failure modes:
+[external-job-identity.md](https://github.com/Inflowenger/go-plugin-sdk/blob/main/docs/external-job-identity.md).
+
+---
+
+## Skill 14 — Report and observe instead of waiting (advanced)
+
+Work that takes hours does not fit in a job. Three budgets say so: the runtime waits
+**15s** for your `jobId`, gives up on a job that sends no command for the node's
+`idle_min`, and ends the run at `ExecuteTimeOut`. So do not wait — **report where the
+work has got to, route a "not yet" port, and end the job in seconds.** The flow's
+process finishes; the external work doesn't; a later run of the same node picks it up
+through `_registry`.
+
+```python
+# Accept stage. Only two inputs exist here: body, and _registry — the node's memory of
+# its own previous run (job commands need a jobId, which this decides).
+async def attach_or_start(ctx: JobContext, job: Job) -> JobContext:
+    body = cast_request_to(job.req.data)
+    prev = (body.registry or {}).get("jobId")
+    if prev and await joern.has(prev):
+        return with_job_id_context(ctx, prev)       # observe what the last run started
+    query_id = await joern.register(body.body["project"], body.body["query"])
+    return with_job_id_context(ctx, query_id)       # start new work
+
+
+async def observe(job: Job) -> None:
+    status = await joern.poll(job.job_id)           # job.job_id IS the upstream id
+    if status.failed:
+        await job.cmd_next_filter(["_exception"])   # fail AND route
+        await job.done_with_error_data(status.error, {"queryId": job.job_id}, "joern")
+    elif not status.done:
+        await job.cmd_next_filter(["pending"])      # a SUCCESSFUL "not yet"
+        await job.done({"state": "running", "percent": status.percent}, "joern")
+    else:
+        await joern.release(job.job_id)
+        await job.cmd_next_filter(["ready"])
+        await job.done({"state": "done", "result": status.result}, "joern")
+```
+
+Declare the ports so the canvas shows them before anything runs:
+
+```python
+Action(
+    method="cpg.query.observe",
+    middleware=[attach_or_start],   # deliberately no stops.middleware — see below
+    request_handler=observe,
+    outbound=[
+        OutboundPort(title="Still running", tags=["pending"]),
+        OutboundPort(title="Result ready", tags=["ready"]),
+        OutboundPort(title="Query failed", tags=["_exception"]),
+    ],
+)
+```
+
+Then the flow closes the loop: the `pending` branch ends in a delay/Continue After
+node, a schedule re-runs it, or a loop edge returns to the node — all of which must
+re-enter **over the same context document**, because `_registry` is the node's entry
+in that document.
+
+Gotchas:
+
+- **"Still running" is `done`, not an error.** The job did look; the answer is "not
+  yet". `done_with_error` there would route the flow's error branch for a perfectly
+  healthy query.
+- **Commit, don't just report.** `job.done(data, "joern")` commits at that key — a
+  bare `done` with no key commits nothing, so the next run (and the next node) sees an
+  empty scope.
+- **`_registry` is per call site and lives in the context document.** Two `GoTo`s onto
+  the same sub-flow keep separate memories; a run over a *new* context starts fresh
+  and will correctly start new upstream work.
+- **`doneAt` / `conclusion` describe the run, not the work.** A "pending" run ends
+  `done`. Only the service knows the work's state. `reqAt` is the useful one — it
+  dates the handle, so you can give up on a stale one.
+- **No `stops.middleware` on an observer action.** Outliving the flow is the point; a
+  stop should not abort the upstream work unless an abandoned job genuinely costs you
+  (then abort it from the signal handler by `sig.job_id`).
+- **Handle the stale handle.** If the service has forgotten the id, start fresh rather
+  than reporting `pending` forever against a query that no longer exists.
+- **Give the loop a floor** — an attempt counter in a contract, or a `reqAt` age limit
+  in the plugin. An observer with no stopping rule is an infinite flow.
+- **Polling costs one job per re-entry.** A one-minute loop over a six-hour build is
+  360 runs. Match the cadence to the work; sub-minute observation belongs inside a
+  single streaming job.
+
+Full treatment, with the three budgets, the registry fields and the limits:
+[detached-work.md](https://github.com/Inflowenger/go-plugin-sdk/blob/main/docs/detached-work.md).
 
 ---
 
@@ -620,8 +841,11 @@ Because the plugin is a persistent process, an action can kick off background wo
 or the plugin can hold connections and run loops between requests. Keep any shared
 state on your own objects and guard it; each `request_handler` runs per invocation.
 This is the plugin shape most likely to want
-[Skill 12](#skill-12--react-when-a-process-ends-signals-optional): background work
-that should be torn down when the process that started it is stopped.
+[Skill 12](#skill-12--stop-a-job-when-its-flow-is-stopped-signals--jobstop): background
+work that should be torn down when the process that started it is stopped. If the work
+is measured in hours rather than minutes, it wants
+[Skill 14](#skill-14--report-and-observe-instead-of-waiting-advanced) instead — report
+and end, rather than hold a job open.
 
 ```python
 async def main() -> None:
@@ -677,3 +901,8 @@ Working *on* the SDK itself? `pip install -e ".[dev]"` and run `pytest`.
 - [ ] Blocking I/O is off the event loop (`asyncio.to_thread` or an async client).
 - [ ] Long-running/shared state is concurrency-safe.
 - [ ] Errors are surfaced via `done_with_error`, not just logged.
+- [ ] If any action must stop with its flow: `middleware=[stops.middleware]` on it,
+      `p.on_signal(stops.on_signal)` before `start()`, and the handler returns on
+      `ctx.canceled` (or catches `jobstop.JobStopped`) without reporting.
+- [ ] If a middleware function names the job from an upstream service, it comes
+      **first** in the list and validates the id (≥ 10 chars, subject-safe).

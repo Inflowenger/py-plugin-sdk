@@ -3,12 +3,13 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import uuid
-
 import json
 
-from .models import Request, Signal, marshal
-from .req import ActionRequest, with_job_handler
+from .context import JobContext, background
+from .job import Job
+from .middleware import job_id_from_context
+from .models import Action, Request, Signal, marshal
+from .req import ActionRequest
 
 
 # ---- subject makers -------------------------------------------------------
@@ -145,24 +146,110 @@ async def actions_handler(p) -> None:
 
         def make_cpu_cb(action):
             async def cpu_cb(msg):
-                if action.request_handler is None:
-                    print(f"recv new request message on action {action.method}")
-                    return
-                job_id = str(uuid.uuid4())
-                new_req = ActionRequest(job_id, action.method, _req_from(p, msg))
-                try:
-                    await with_job_handler(action.request_handler, p.jobs)(new_req, msg)
-                except Exception as e:
-                    # Handler errors are already reported to the runtime as
-                    # DoneWithError inside with_job_handler. Reaching here means the
-                    # accept/ack itself failed (no jobId assigned, nothing to report)
-                    # — just log so the plugin keeps serving other requests.
-                    print(f"action {action.method} accept error: {e}")
+                await dispatch_action(p, action, msg)
 
             return cpu_cb
 
         await conn.subscribe(make_action_cpu(p.plugin_id, action.method), cb=make_cpu_cb(action))
         print(f"Subscribed Action : {make_action_cpu(p.plugin_id, action.method)}")
+
+
+async def dispatch_action(p, action: Action, msg) -> None:
+    """Start one execution request's pipeline on a task of its own, so neither
+    its middleware nor its handler holds up the requests behind it on the
+    subscription.
+
+    nats-py delivers one subscription's messages serially — it awaits each
+    callback before pulling the next — and every call to an action shares the
+    subject inflow.cpu.<PLUGIN_ID>.<method>. Running the pipeline inline would
+    therefore head-of-line-block every concurrent call to the same action (a
+    parallel flow branch is exactly this). Mirrors Go's dispatchAction, where the
+    same job is done by `go`."""
+    if action.request_handler is None:
+        # Say so, rather than leave the runtime waiting out its 15s accept budget
+        # for a jobId that is never coming. Mirrors Go.
+        await ActionRequest("", action.method, _req_from(p, msg)).reject(
+            msg, '{"error":"action not implemented"}'
+        )
+        print(f"recv new request message on action {action.method}: no request_handler")
+        return
+    task = asyncio.create_task(run_pipeline(p, action, _req_from(p, msg), msg))
+    # asyncio only keeps a weak reference to a bare task; hold a strong one on
+    # the plugin so the loop cannot collect it mid-flight.
+    p.jobs.add(task)
+    task.add_done_callback(p.jobs.discard)
+
+
+async def run_pipeline(p, action: Action, req: Request, msg) -> None:
+    """Run a request's middleware functions in order (Plugin.pipeline), then
+    accept the job — reply the jobId — and run the handler. The job's context
+    begins here and ends when this returns: once the handler has, or as soon as
+    the request is rejected. Mirrors Go's runPipeline."""
+    ctx, end = background().with_cancel()
+    try:
+        try:
+            accepted, job = await run_middleware(p, action, ctx, Job(p, action.method, "", req))
+        except Exception as e:
+            await reject_request(p, action, msg, e)
+            return
+
+        live = (await ActionRequest(job.job_id, job.action, job.req).accept(msg)).with_context(
+            accepted
+        )
+        try:
+            result = action.request_handler(live)
+            if inspect.isawaitable(result):
+                await result
+        except Exception as e:
+            if accepted.canceled:
+                # The job was stopped: ctx.run / an aborted client raised its way
+                # out of the handler. The runtime has already concluded this job
+                # and stopped listening, so reporting would only retry against a
+                # subject with no responder. (In Go a cancellation is a returned
+                # error the handler inspects, so this path cannot arise there.)
+                print(f"job {live.job_id} ended by cancellation: {e}")
+                return
+            # Accepted: the runtime is waiting on the job, so an exception is its
+            # failure — never swallowed, or the runtime hangs waiting for a
+            # result that never comes. (done_with_error goes through Plugin.send,
+            # which reports rather than raises, so this cannot itself crash the
+            # plugin.)
+            await live.done_with_error(str(e))
+    finally:
+        end()
+
+
+async def run_middleware(
+    p, action: Action, ctx: JobContext, job: Job
+) -> tuple[JobContext, Job]:
+    """Run the request's middleware functions in order, each on the context the
+    one before returned, keeping Job.job_id in step with the jobId bound to the
+    context. The first exception stops it, and so does a job no function named.
+    Mirrors Go's runMiddleware."""
+    for fn in p.pipeline(action):
+        nxt = fn(ctx, job)
+        if inspect.isawaitable(nxt):
+            nxt = await nxt
+        if nxt is not None:
+            ctx = nxt
+        bound = job_id_from_context(ctx)
+        if bound != "" and bound != job.job_id:
+            job = job.with_job_id(bound)
+    if job.job_id == "":
+        raise ValueError(
+            "no jobId: the first middleware function (job_id, or with_job_id's) bound none"
+        )
+    return ctx, job
+
+
+async def reject_request(p, action: Action, msg, err: BaseException) -> None:
+    """Answer a request with an error instead of a jobId. Mirrors Go's
+    rejectRequest."""
+    reason = str(err) or err.__class__.__name__
+    print(f"action {action.method} rejected: {reason}")
+    await ActionRequest("", action.method, _req_from(p, msg)).reject(
+        msg, json.dumps({"error": reason}, separators=(",", ":"))
+    )
 
 
 async def meta_func_handler(p) -> None:
@@ -186,6 +273,24 @@ async def meta_func_handler(p) -> None:
 
         await conn.subscribe(make_action_subject(p.plugin_id, meta.method), cb=make_cb(meta))
         print(f"Meta Function Service : {make_action_subject(p.plugin_id, meta.method)}")
+
+
+def signal_port_note(p) -> str:
+    """What start() logs when no on_signal handler is registered. The port then
+    has no subscription, so no signal reaches the plugin — harmless for most
+    plugins, but a stop capability added as middleware (jobstop's) then silently
+    never fires. Naming where middleware is added points at the likely victims.
+    Mirrors Go's signalPortNote."""
+    note = (
+        f"Signals not subscribed on : {make_signal_subject(p.plugin_id)} "
+        "(no on_signal handler registered: no stop will reach any job)"
+    )
+    if p.middlewares:
+        note += "; plugin middleware is set"
+    with_middleware = [a.method for a in p.actions if a.middleware]
+    if with_middleware:
+        note += "; actions with middleware: " + ", ".join(with_middleware)
+    return note
 
 
 def parse_signal(plugin_id: str, msg) -> Signal:
@@ -217,6 +322,7 @@ async def signals_handler(p) -> None:
     subscribes to nothing — the port is opt-in. Mirrors Go's signalsHandler."""
     handler = p.signal_fn
     if handler is None:
+        print(signal_port_note(p))
         return
     conn = p.infra_conn.get_connection()
     if conn is None:

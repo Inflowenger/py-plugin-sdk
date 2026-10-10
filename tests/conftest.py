@@ -54,3 +54,27 @@ def plugin(conn: MockConn) -> Plugin:
     p.plugin_id = "PID"
     p.infra_conn = MockInfra(conn)
     return p
+
+
+class RecordingPlugin(Plugin):
+    """A plugin whose `send` records commands instead of publishing them, so a
+    test can see what a handler reported (and that a stopped handler reported
+    nothing)."""
+
+    def __init__(self, plugin_id: str = "PID"):
+        super().__init__()
+        self.plugin_id = plugin_id
+        self.sent: list[tuple[str, bytes]] = []
+
+    async def send(self, subject: str, data: bytes):
+        self.sent.append((subject, data))
+        return MockMsg(data=b"OK"), None
+
+    def job_ids_seen(self) -> list[str]:
+        """The jobId segment of every command sent, in order."""
+        return [s.split(".")[3] for s, _ in self.sent]
+
+
+@pytest.fixture
+def rec() -> RecordingPlugin:
+    return RecordingPlugin()
